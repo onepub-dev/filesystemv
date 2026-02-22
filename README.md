@@ -1,67 +1,198 @@
 # filesystemv
-A virtual file system that allows you to overload a real filesystem with the virtual file system allowing reads from the overloaded file system but writes are virtualized.
 
-FileSystemV allows your Dart application to read from the underlying real file system but redirects writes to a temporary area.
+`filesystemv` provides a write-overlay virtual filesystem for Dart. Reads come
+from the host filesystem, while writes are redirected into a virtual store.
 
-When the virtual file system shutsdown any writes are lost and the underlying file system remains intact as it was before the virtual file system was created.
+This is useful for tests and dry-run workflows where code should behave as if
+it writes to disk, without mutating the real machine state.
 
-FileSystemV is well suited to running unit tests that need access to the host file system but you want to avoid the unit tests making any changes.
+## Sponsored by OnePub
 
-FileSystemV use io.Overrides to intercept any write attempts to the file system.
+![OnePub](images/onepub-logo.svg)
 
-NOTE: any spawned processes or native calls will bypass the virtual file system and write directly to the host file system.
+Help support DCli by supporting [OnePub](https://onepub.dev), the private dart
+repository. OnePub allows you to privately share dart packages between your own
+projects or with colleagues.
 
-FileSystemV allows you to virtualise the entire host file system or just specific directories:
+## API
 
-Virtualise the entire file system.
 ```dart
-import 'package:dcli/dcli.dart';
-void main() {
-  withVFileSystem(() {
-    var pathToEtcHost = '/etc/hosts';
-    pathToEtcHost.append(*172.0.0.1 mytesthost');
-});
+Future<String> withVFileSystem(
+  FutureOr<void> Function(String virtualRoot) action, {
+  List<String>? paths,
+  String? store,
+})
 ```
 
-Virtualise specific directories:
+- `virtualRoot`: path to the overlay store directory.
+- `paths`: optional list of paths to virtualize. If omitted, all paths are
+  virtualized.
+- `store`: optional storage directory for overlay data. If omitted, a temp
+  directory is created and cleaned up automatically.
+- Return value: the overlay store path.
 
-```dart
-import 'package:dcli/dcli.dart';
-void main() {
-  withVFileSystem(() {
-    var pathToEtcHost = '/etc/hosts';
-    pathToEtcHost.append(*172.0.0.1 mytesthost');
-},
-paths: [
-'/etc/hosts',
-r'$HOME/.pub_cache'
-]);
+## Installation
+
+```yaml
+dependencies:
+  filesystemv: ^0.1.0
 ```
 
-Any files/directories that are not virtualised will be written to directly.
+## Examples
 
-If you open a file for writing, the virtual file system will copy the entire file into the virtual file system before the call to open returns - with the obvious performance overhead this imposes.
-
-When you call vFileSystem it creates a temp folder at $TEMP to store any written files.  When the call to `withVFileSystem` returns it will delete that temporary directory.
-If you need to control where the files are stored or if you need access to the temporary directory after `withVFileSystem` returns, you can pass in your own path to store the files.
-
+### 1. Virtualize all writes
 
 ```dart
-import 'package:dcli/dcli.dart';
-void main() async {
-  var pathToSomeFile = '/somefile';
-  await withTempDirectoryAsync((tempDir) {
-    await withVFileSystem(() {
-      var pathToEtcHost = '/etc/hosts';
-      pathToEtcHost.append(*172.0.0.1 mytesthost');
-      pathToSomeFile.write('Hello World');    
-    },
-    , store: tempDir);
+import 'dart:io';
+import 'package:filesystemv/filesystemv.dart';
 
-  // you can now access tempDir
-  expect(exists(pathToSomeFile), true);
+Future<void> main() async {
+  await withVFileSystem((virtualRoot) {
+    final hosts = File('/etc/hosts');
+    hosts.writeAsStringSync('127.0.0.1 local-only\n');
+
+    print('Overlay root: $virtualRoot');
+    print('Virtual hosts: ${hosts.readAsStringSync()}');
+  });
 }
 ```
 
+### 2. Virtualize only selected paths
 
+```dart
+import 'dart:io';
+import 'package:filesystemv/filesystemv.dart';
 
+Future<void> main() async {
+  final cachePath = '${Platform.environment['HOME']}/.pub-cache';
+  await withVFileSystem((_) {
+    File('$cachePath/notes.txt').writeAsStringSync('virtual cache write\n');
+    File('/tmp/real-file.txt').writeAsStringSync('real write\n');
+  }, paths: [cachePath]);
+}
+```
+
+### 3. Keep the overlay store for post-run inspection
+
+```dart
+import 'dart:io';
+import 'package:filesystemv/filesystemv.dart';
+
+Future<void> main() async {
+  final store = Directory.systemTemp.createTempSync('filesystemv-store-');
+  final root = await withVFileSystem((_) {
+    File('/tmp/report.txt').writeAsStringSync('overlay report');
+  }, store: store.path);
+
+  print('Overlay store retained at: $root');
+}
+```
+
+### 4. Spawn a process using the virtual store as CWD
+
+```dart
+import 'dart:io';
+import 'package:filesystemv/filesystemv.dart';
+
+Future<void> main() async {
+  await withVFileSystem((virtualRoot) async {
+    'process.txt'.write('hello world');
+    // bash will only see files in the virtualRoot that have been modified 
+    await Process.run(
+      'bash',
+      ['-lc', 'pwd && echo "hello again" >> process.txt && cat process.txt'],
+      workingDirectory: virtualRoot,
+    );
+  });
+}
+```
+
+### 5. Use with `path` and `dcli`
+
+```dart
+import 'dart:io';
+import 'package:dcli/dcli.dart';
+import 'package:filesystemv/filesystemv.dart';
+import 'package:path/path.dart' as p;
+
+Future<void> main() async {
+  final root = Directory.systemTemp.createTempSync('fsv-demo-');
+  final pathToFile = p.join(root.path, 'demo.txt');
+
+  await withVFileSystem((_) {
+    pathToFile.write('line-1', newline: '');
+    pathToFile.append('line-2', newline: '');
+    print(File(pathToFile).readAsStringSync()); // line-1line-2
+  });
+
+  print(File(pathToFile).existsSync()); // false
+}
+```
+
+### 6. Link operations
+
+```dart
+import 'dart:io';
+import 'package:filesystemv/filesystemv.dart';
+
+Future<void> main() async {
+  final target = File('/tmp/target.txt')..writeAsStringSync('host');
+  final link = Link('/tmp/target-link')..createSync(target.path);
+
+  await withVFileSystem((_) {
+    Link(link.path).updateSync('/tmp/another-target.txt');
+  }, paths: [link.path]);
+
+  // host link remains unchanged
+  print(Link(link.path).targetSync() == target.path);
+}
+```
+
+## Additional Use Cases
+
+- Protecting host state in integration tests that call third-party libraries.
+- Running migration tools in dry-run mode while preserving real data.
+- Safe experimentation with config rewrites in CI smoke tests.
+- Testing symlink and path handling logic without mutating real links.
+- Capturing generated artifacts from tools in a temporary isolated workspace.
+
+## Example App
+
+A comprehensive runnable example is available at:
+
+- `example/filesystemv_example.dart`
+
+Run it with:
+
+```bash
+dart run example/filesystemv_example.dart
+```
+
+## Benchmark Harness
+
+Run the local micro-benchmark harness:
+
+```bash
+dart run tool/benchmark_filesystemv.dart
+```
+
+Each run writes a JSON result to `tool/benchmark_results/` and prints a
+comparison against the previous 3 runs.
+
+Optional flags:
+
+```bash
+dart run tool/benchmark_filesystemv.dart --entries=50000 --reads=100000 --writes=25000
+```
+
+## Current Holes and Limitations
+
+- Dart `File`/`Directory`/`Link` objects created before entering `withVFileSystem`
+  are not retroactively virtualized. Create new handles inside the zone.
+- Spawned native processes bypass Dart `IOOverrides` unless they are directed to
+  the overlay path explicitly (for example by using `virtualRoot` as CWD and
+  relative paths).
+- Directory materialization currently copies recursively (directories not files )
+  when needed, which may be expensive for large trees .
+- Path mapping for unusual platform-specific forms (for example complex Windows
+  UNC variations) is not fully hardened yet.

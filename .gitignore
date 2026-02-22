@@ -27,3 +27,6 @@ doc/api/
 
 .flutter-plugins
 .flutter-plugins-dependencies
+logs/*
+.mcp_logs/*
+tool/benchmark_results/*.json
