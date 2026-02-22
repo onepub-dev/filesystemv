@@ -30,3 +30,4 @@ doc/api/
 logs/*
 .mcp_logs/*
 tool/benchmark_results/*.json
+.failed_tracker
