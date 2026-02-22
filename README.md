@@ -8,10 +8,9 @@ it writes to disk, without mutating the real machine state.
 
 ## Sponsored by OnePub
 
-![OnePub](images/onepub-logo.svg)
+<img src="images/onepub-logo.svg" alt="OnePub" width="220" />
 
-Help support DCli by supporting [OnePub](https://onepub.dev), the private dart
-repository. OnePub allows you to privately share dart packages between your own
+Help support FileSystemV by supporting [OnePub](https://onepub.dev), the **private dart repository**. OnePub allows you to privately share dart packages between your own
 projects or with colleagues.
 
 ## API
