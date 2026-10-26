@@ -1,3 +1,4 @@
+#! /usr/bin/env dcli
 // this is a cli script.
 // ignore_for_file: avoid_print
 
@@ -28,8 +29,12 @@ Future<void> main() async {
       ..write('generated-1', newline: '')
       ..append('generated-2', newline: '');
 
-    // Link update is virtualized.
-    Link(hostLink.path).updateSync(hostScopedFile);
+    // Virtualized Link handles are intentionally unsupported in 0.2.0.
+    try {
+      Link(hostLink.path).updateSync(hostScopedFile);
+    } on FileSystemException catch (error) {
+      print('Link operation rejected: ${error.message}');
+    }
 
     // Spawn process against overlay as working directory.
     final proc = await Process.run(
@@ -43,7 +48,6 @@ Future<void> main() async {
 
     print('Inside overlay file: ${read(hostFile)}');
     print('Inside overlay generated file: ${read(generated)}');
-    print('Inside overlay link target: ${Link(hostLink.path).targetSync()}');
   }, paths: [hostRoot]);
 
   print('withVFileSystem returned overlay path: $overlayPath');

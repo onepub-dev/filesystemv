@@ -3,8 +3,10 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import 'guarded_entities.dart';
 import 'resolved_path_cache.dart';
 import 'shadowed_path_index.dart';
+import 'store_path_guard.dart';
 
 final class OverlayOverrides extends IOOverrides {
   OverlayOverrides({
@@ -17,7 +19,7 @@ final class OverlayOverrides extends IOOverrides {
             .map(normalizePath)
             .toList(growable: false),
         _shadowedPaths = ShadowedPathIndex(
-          storageRoot: storageRoot,
+          storageRoot: checkStore(storageRoot),
           maxInMemoryEntries: maxShadowedInMemoryEntries,
           maxLookupCacheEntries: maxShadowedLookupCacheEntries,
         ),
@@ -36,40 +38,87 @@ final class OverlayOverrides extends IOOverrides {
   @override
   File createFile(String path) {
     final realPath = normalizePath(path);
+    _checkDirectStorePath(realPath);
     if (!_shouldVirtualizeNormalized(realPath)) {
-      return super.createFile(path);
+      return GuardedFile(
+          this, super.createFile(_isStorePath(realPath) ? realPath : path));
     }
 
-    _markShadowed(realPath);
     final virtualPath = _toVirtualPath(realPath);
-    _materializeFile(realPath, virtualPath);
-    return super.createFile(virtualPath);
+    _checkStorePath(virtualPath);
+    if (!_isShadowed(realPath)) {
+      _materializeFile(realPath, virtualPath);
+      _markShadowed(realPath);
+    }
+    return GuardedFile(this, super.createFile(virtualPath));
   }
 
   @override
   Directory createDirectory(String path) {
     final realPath = normalizePath(path);
+    _checkDirectStorePath(realPath);
     if (!_shouldVirtualizeNormalized(realPath)) {
-      return super.createDirectory(path);
+      return GuardedDirectory(this,
+          super.createDirectory(_isStorePath(realPath) ? realPath : path));
     }
 
-    _resolvedReadPathCache.invalidate(realPath);
     final virtualPath = _toVirtualPath(realPath);
-    _materializeDirectory(realPath, virtualPath);
-    return super.createDirectory(virtualPath);
+    _resolvedReadPathCache.invalidate(virtualPath);
+    _checkStorePath(virtualPath);
+    if (!_isShadowed(realPath)) {
+      _materializeDirectory(realPath, virtualPath);
+    }
+    return GuardedDirectory(this, super.createDirectory(virtualPath));
   }
 
   @override
   Link createLink(String path) {
     final realPath = normalizePath(path);
-    if (!_shouldVirtualizeNormalized(realPath)) {
-      return super.createLink(path);
+    if (!_isStorePath(realPath) && !_shouldVirtualizeNormalized(realPath)) {
+      return GuardedLink(this, super.createLink(path));
     }
 
-    _markShadowed(realPath);
-    final virtualPath = _toVirtualPath(realPath);
-    _materializeLink(realPath, virtualPath);
-    return super.createLink(virtualPath);
+    // Returning a native Link would allow create/update to install arbitrary
+    // host targets, including after a File handle has already been obtained.
+    throw FileSystemException(
+      'Virtualized Link handles are not supported',
+      path,
+    );
+  }
+
+  @override
+  Directory getCurrentDirectory() =>
+      createDirectory(super.getCurrentDirectory().path);
+
+  @override
+  Directory getSystemTempDirectory() =>
+      createDirectory(super.getSystemTempDirectory().path);
+
+  @override
+  void setCurrentDirectory(String path) => throw FileSystemException(
+        'Changing the current directory is not supported in an overlay',
+        path,
+      );
+
+  /// Recheck retained handles before native operations.
+  void validateHandlePath(String path) =>
+      _checkDirectStorePath(normalizePath(path));
+
+  /// The store is a terminating, guarded root for derived parent handles.
+  Directory parentOf(String path) {
+    final normalized = normalizePath(path);
+    validateHandlePath(normalized);
+    return createDirectory(
+        normalized == storageRoot ? storageRoot : p.dirname(normalized));
+  }
+
+  /// A deleted directory also hides host descendants not yet materialized.
+  void didDelete(String path) {
+    final normalized = normalizePath(path);
+    if (_isStorePath(normalized)) {
+      _shadowedPaths.add(normalized);
+      _resolvedReadPathCache.invalidate(normalized);
+    }
   }
 
   @override
@@ -101,7 +150,7 @@ final class OverlayOverrides extends IOOverrides {
       super.fsWatch(_resolveForRead(path), events, recursive);
 
   bool _shouldVirtualizeNormalized(String path) {
-    if (path == storageRoot || p.isWithin(storageRoot, path)) {
+    if (_isStorePath(path)) {
       return false;
     }
     if (_virtualizeAll) {
@@ -118,36 +167,40 @@ final class OverlayOverrides extends IOOverrides {
 
   String _resolveForRead(String rawPath) {
     final realPath = normalizePath(rawPath);
-    final cached = _resolvedReadPathCache.get(realPath);
+    _checkDirectStorePath(realPath);
+    if (!_shouldVirtualizeNormalized(realPath)) {
+      // Direct store paths must not share logical-path cache entries, which
+      // can still point to host data before first materialization.
+      return _isStorePath(realPath) ? realPath : rawPath;
+    }
+    final virtualPath = _toVirtualPath(realPath);
+    // Validate even cache hits: persisted store contents may have changed.
+    _checkStorePath(virtualPath);
+    final cached = _resolvedReadPathCache.get(virtualPath);
     if (cached != null) {
       return cached;
     }
 
-    if (!_shouldVirtualizeNormalized(realPath)) {
-      _resolvedReadPathCache.put(realPath, rawPath);
-      return rawPath;
-    }
-
-    final virtualPath = _toVirtualPath(realPath);
     if (_isShadowed(realPath)) {
-      _resolvedReadPathCache.put(realPath, virtualPath);
+      _resolvedReadPathCache.put(virtualPath, virtualPath);
       return virtualPath;
     }
     final resolved =
         super.fseGetTypeSync(virtualPath, true) == FileSystemEntityType.notFound
             ? realPath
             : virtualPath;
-    _resolvedReadPathCache.put(realPath, resolved);
+    _resolvedReadPathCache.put(virtualPath, resolved);
     return resolved;
   }
 
   void _markShadowed(String realPath) {
-    _shadowedPaths.add(realPath);
-    _resolvedReadPathCache.invalidate(realPath);
+    final virtualPath = _toVirtualPath(realPath);
+    _shadowedPaths.add(virtualPath);
+    _resolvedReadPathCache.invalidate(virtualPath);
   }
 
   bool _isShadowed(String realPath) =>
-      _shadowedPaths.containsAncestor(realPath);
+      _shadowedPaths.containsAncestor(_toVirtualPath(realPath));
 
   void _materializeFile(String realPath, String virtualPath) {
     final virtualFile = super.createFile(virtualPath);
@@ -175,21 +228,48 @@ final class OverlayOverrides extends IOOverrides {
     virtualDirectory.createSync(recursive: true);
   }
 
-  void _materializeLink(String realPath, String virtualPath) {
-    final virtualLink = super.createLink(virtualPath);
-    final virtualType = super.fseGetTypeSync(virtualPath, false);
-    if (virtualType == FileSystemEntityType.link) {
-      return;
+  bool _isStorePath(String path) {
+    if (path == storageRoot || p.isWithin(storageRoot, path)) {
+      return true;
     }
-
-    final realLink = super.createLink(realPath);
-    final realType = super.fseGetTypeSync(realPath, false);
-    if (realType != FileSystemEntityType.link) {
-      return;
+    // Resolve the nearest existing ancestor to detect aliases, including when
+    // the final file does not exist yet. Native handles avoid recursive hooks.
+    final missing = <String>[];
+    var cursor = path;
+    while (
+        super.fseGetTypeSync(cursor, false) == FileSystemEntityType.notFound) {
+      missing.insert(0, p.basename(cursor));
+      final parent = p.dirname(cursor);
+      if (parent == cursor) {
+        return false;
+      }
+      cursor = parent;
     }
+    String canonical;
+    try {
+      canonical = super.createDirectory(cursor).resolveSymbolicLinksSync();
+    } on FileSystemException {
+      // A dangling outside link cannot currently lead into the store.
+      return false;
+    }
+    final resolved = p.joinAll([canonical, ...missing]);
+    return resolved == storageRoot || p.isWithin(storageRoot, resolved);
+  }
 
-    virtualLink.parent.createSync(recursive: true);
-    virtualLink.createSync(realLink.targetSync(), recursive: true);
+  void _checkDirectStorePath(String path) {
+    if (_isStorePath(path)) {
+      _checkStorePath(path);
+    }
+  }
+
+  void _checkStorePath(String path) {
+    if (!_isStorePath(path)) {
+      throw FileSystemException('Path is outside the overlay store', path);
+    }
+    checkStorePath(
+      path,
+      getTypeWithoutFollowingLinks: (path) => super.fseGetTypeSync(path, false),
+    );
   }
 
   String _toVirtualPath(String realPath) {

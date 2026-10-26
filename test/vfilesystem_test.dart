@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 void main() {
+  final throwsFileSystemException = throwsA(isA<FileSystemException>());
   group('withVFileSystem', () {
     late Directory root;
     late Directory scoped;
@@ -121,12 +122,12 @@ void main() {
       expect(fileA.readAsStringSync(), 'A');
     });
 
-    test('virtualizes link update operations', () async {
+    test('rejects virtualized link target and update operations', () async {
       final targetB = fileB.path;
       await withVFileSystem((_) {
-        expect(Link(linkA.path).targetSync(), fileA.path);
-        Link(linkA.path).updateSync(targetB);
-        expect(Link(linkA.path).targetSync(), targetB);
+        expect(() => Link(linkA.path).targetSync(), throwsFileSystemException);
+        expect(() => Link(linkA.path).updateSync(targetB),
+            throwsFileSystemException);
       }, paths: [linkA.path]);
 
       expect(Link(linkA.path).targetSync(), fileA.path);
@@ -139,6 +140,35 @@ void main() {
       }, paths: [linkA.path]);
 
       expect(fileA.readAsStringSync(), 'A');
+    });
+
+    test('overlay-created file link cannot overwrite a host file', () async {
+      final virtualLink = p.join(root.path, 'virtual-link');
+
+      await withVFileSystem((_) {
+        expect(
+          () => Link(virtualLink).createSync(fileA.path, recursive: true),
+          throwsFileSystemException,
+        );
+        File(virtualLink).writeAsStringSync('isolated');
+      });
+
+      expect(fileA.readAsStringSync(), 'A');
+    });
+
+    test('overlay-created directory link cannot create a host file', () async {
+      final virtualLink = p.join(root.path, 'virtual-dir-link');
+      final hostChild = File(p.join(scoped.path, 'escaped.txt'));
+
+      await withVFileSystem((_) {
+        expect(
+          () => Link(virtualLink).createSync(scoped.path, recursive: true),
+          throwsFileSystemException,
+        );
+        File(p.join(virtualLink, 'escaped.txt')).writeAsStringSync('isolated');
+      });
+
+      expect(hostChild.existsSync(), isFalse);
     });
 
     test('link updates outside scoped paths stay real', () async {
@@ -155,6 +185,187 @@ void main() {
           realLink.deleteSync();
         }
       }
+    });
+
+    test('rejects async link creation and updates before returning a handle',
+        () async {
+      await withVFileSystem((_) async {
+        await expectLater(
+          Future<void>.sync(() async {
+            await Link(p.join(root.path, 'async-link')).create(fileA.path);
+          }),
+          throwsFileSystemException,
+        );
+        await expectLater(
+          Future<void>.sync(() async {
+            await Link(linkA.path).update(fileB.path);
+          }),
+          throwsFileSystemException,
+        );
+      });
+      expect(linkA.targetSync(), fileA.path);
+      expect(fileA.readAsStringSync(), 'A');
+      expect(fileB.readAsStringSync(), 'B');
+    });
+
+    test('rejects direct store links even with selected paths', () async {
+      await withVFileSystem((store) {
+        for (final target in [fileA.path, '../a.txt', scoped.path]) {
+          expect(
+            () => Link(p.join(store, 'escape')).createSync(target),
+            throwsFileSystemException,
+          );
+        }
+      }, paths: [scoped.path]);
+      expect(fileA.readAsStringSync(), 'A');
+    });
+
+    for (final location in [
+      'file',
+      'directory',
+      'dangling',
+      'relative',
+      'index',
+      'index-bucket',
+    ]) {
+      test('rejects persisted $location symlink before entering the overlay',
+          () async {
+        final store = Directory(p.join(root.path, 'store'))..createSync();
+        final mappedFile = p.join(
+            store.path, p.relative(fileA.path, from: p.rootPrefix(fileA.path)));
+        final String linkPath;
+        final String target;
+        switch (location) {
+          case 'directory':
+            linkPath = p.dirname(mappedFile);
+            target = root.path;
+          case 'dangling':
+            linkPath = mappedFile;
+            target = p.join(root.path, 'missing-host-file');
+          case 'relative':
+            linkPath = mappedFile;
+            target = p.relative(fileA.path, from: p.dirname(linkPath));
+          case 'index':
+            linkPath = p.join(store.path, '.filesystemv_shadow_index');
+            target = scoped.path;
+          case 'index-bucket':
+            linkPath = p.join(store.path, '.filesystemv_shadow_index', '0.bin');
+            target = fileA.path;
+          default:
+            linkPath = mappedFile;
+            target = fileA.path;
+        }
+        Directory(p.dirname(linkPath)).createSync(recursive: true);
+        Link(linkPath).createSync(target);
+
+        var entered = false;
+        await expectLater(
+          withVFileSystem((_) {
+            entered = true;
+            File(fileA.path).writeAsStringSync('escaped');
+          }, store: store.path),
+          throwsFileSystemException,
+        );
+
+        expect(entered, isFalse);
+        expect(fileA.readAsStringSync(), 'A');
+        expect(
+            File(p.join(root.path, 'missing-host-file')).existsSync(), isFalse);
+        expect(scoped.listSync().map((entry) => entry.path), [fileB.path]);
+      });
+    }
+
+    test('rejects a symlink store root including through an aliased parent',
+        () async {
+      final alias = Link(p.join(root.path, 'store-alias'))
+        ..createSync(scoped.path);
+      Link(p.join(scoped.path, 'nested-link')).createSync(root.path);
+      for (final store in [alias.path, p.join(alias.path, 'nested-link')]) {
+        await expectLater(
+          withVFileSystem((_) => fail('unsafe store was accepted'),
+              store: store),
+          throwsFileSystemException,
+        );
+      }
+      expect(Directory(p.join(scoped.path, 'new-store')).existsSync(), isFalse);
+      expect(fileB.readAsStringSync(), 'B');
+    });
+
+    for (final suffix in ['existing', 'missing/parent/store']) {
+      test('canonicalizes aliased store ancestors for $suffix', () async {
+        final alias = Link(p.join(root.path, 'parent-alias'))
+          ..createSync(scoped.path);
+        final requested = p.join(alias.path, suffix);
+        if (suffix == 'existing') {
+          Directory(requested).createSync();
+        }
+        final expected = p.join(scoped.resolveSymbolicLinksSync(), suffix);
+        final returned = await withVFileSystem((virtualRoot) {
+          expect(virtualRoot, expected);
+          File(fileA.path).writeAsStringSync('overlay');
+          expect(File(fileA.path).readAsStringSync(), 'overlay');
+          expect(() => Link(p.join(virtualRoot, 'escape')),
+              throwsFileSystemException);
+        }, store: requested);
+        expect(returned, expected);
+        expect(Directory(returned).existsSync(), isTrue);
+        expect(fileA.readAsStringSync(), 'A');
+      });
+    }
+
+    test('rejects persisted symlinks beneath an aliased store parent',
+        () async {
+      final alias = Link(p.join(root.path, 'parent-alias'))
+        ..createSync(scoped.path);
+      final store = Directory(p.join(scoped.path, 'store'))..createSync();
+      Link(p.join(store.path, 'escape')).createSync(fileA.path);
+      await expectLater(
+        withVFileSystem((_) => fail('unsafe store was accepted'),
+            store: p.join(alias.path, 'store')),
+        throwsFileSystemException,
+      );
+      expect(fileA.readAsStringSync(), 'A');
+      expect(
+          Directory(p.join(store.path, '.filesystemv_shadow_index'))
+              .existsSync(),
+          isFalse);
+    });
+
+    test('default temp store is canonical and cleaned up', () async {
+      late String canonicalRoot;
+      final returned = await withVFileSystem((virtualRoot) {
+        canonicalRoot = Directory(virtualRoot).resolveSymbolicLinksSync();
+        expect(virtualRoot, canonicalRoot);
+        File(fileA.path).writeAsStringSync('overlay');
+      });
+      expect(returned, canonicalRoot);
+      expect(Directory(returned).existsSync(), isFalse);
+      expect(fileA.readAsStringSync(), 'A');
+    });
+
+    test('rechecks store paths for files directories and cached metadata',
+        () async {
+      final store = Directory(p.join(root.path, 'store'))..createSync();
+      final mappedParent = Directory(p.join(store.resolveSymbolicLinksSync(),
+          p.relative(root.path, from: p.rootPrefix(root.path))));
+      final injectedLink = Link(mappedParent.path);
+      await withVFileSystem((virtualRoot) {
+        File(fileA.path);
+        expect(
+            FileSystemEntity.typeSync(fileA.path), FileSystemEntityType.file);
+        // Pre-zone handles simulate a store changed by an external writer.
+        mappedParent.deleteSync(recursive: true);
+        injectedLink.createSync(root.path);
+
+        expect(() => File(fileA.path), throwsFileSystemException);
+        expect(() => Directory(root.path), throwsFileSystemException);
+        expect(() => FileSystemEntity.typeSync(fileA.path),
+            throwsFileSystemException);
+        expect(() => File(p.join(mappedParent.path, 'a.txt')),
+            throwsFileSystemException);
+        expect(() => Directory(mappedParent.path), throwsFileSystemException);
+      }, store: store.path);
+      expect(fileA.readAsStringSync(), 'A');
     });
 
     test('keeps overlay store when custom store is provided', () async {
@@ -250,7 +461,8 @@ void main() {
       expect(fileB.readAsStringSync(), 'B');
     });
 
-    test('supports rename copy and delete without mutating host', () async {
+    test('rejects rename and copy but supports delete without mutating host',
+        () async {
       final hostBefore = fileA.readAsStringSync();
       final renamed = p.join(root.path, 'renamed.txt');
       final copied = p.join(root.path, 'copied.txt');
@@ -258,16 +470,18 @@ void main() {
       await withVFileSystem((_) {
         final source = File(fileA.path);
         final copiedFile = File(copied);
-        source.copySync(copiedFile.path);
-        expect(copiedFile.readAsStringSync(), 'A');
+        expect(
+            () => source.copySync(copiedFile.path), throwsFileSystemException);
+        expect(copiedFile.existsSync(), isFalse);
 
         final renamedFile = File(renamed);
-        source.renameSync(renamedFile.path);
-        expect(renamedFile.readAsStringSync(), 'A');
-        expect(source.existsSync(), isFalse);
-
-        renamedFile.deleteSync();
+        expect(() => source.renameSync(renamedFile.path),
+            throwsFileSystemException);
         expect(renamedFile.existsSync(), isFalse);
+        expect(source.existsSync(), isTrue);
+
+        source.deleteSync();
+        expect(source.existsSync(), isFalse);
       });
 
       expect(fileA.readAsStringSync(), hostBefore);
@@ -296,8 +510,8 @@ void main() {
       final hostTarget = Link(linkA.path).targetSync();
 
       await withVFileSystem((_) {
-        Link(linkA.path).updateSync(fileB.path);
-        expect(Link(linkA.path).targetSync(), fileB.path);
+        expect(() => Link(linkA.path).updateSync(fileB.path),
+            throwsFileSystemException);
       });
 
       expect(Link(linkA.path).targetSync(), hostTarget);
@@ -360,14 +574,19 @@ void main() {
       final tempCwd = Directory(p.join(root.path, 'cwd'))
         ..createSync(recursive: true);
 
-      await withVFileSystem((_) {
-        Directory.current = tempCwd.path;
-        File('relative.txt').writeAsStringSync('virtual-relative');
-        expect(File('relative.txt').readAsStringSync(), 'virtual-relative');
-        expect(File(p.join(tempCwd.path, 'relative.txt')).existsSync(), isTrue);
-      }, paths: [tempCwd.path]);
-
-      Directory.current = hostCwd;
+      Directory.current = tempCwd.path;
+      try {
+        await withVFileSystem((_) {
+          expect(() => Directory.current = tempCwd.path,
+              throwsFileSystemException);
+          File('relative.txt').writeAsStringSync('virtual-relative');
+          expect(File('relative.txt').readAsStringSync(), 'virtual-relative');
+          expect(
+              File(p.join(tempCwd.path, 'relative.txt')).existsSync(), isTrue);
+        }, paths: [tempCwd.path]);
+      } finally {
+        Directory.current = hostCwd;
+      }
       expect(File(p.join(tempCwd.path, 'relative.txt')).existsSync(), isFalse);
     });
 
